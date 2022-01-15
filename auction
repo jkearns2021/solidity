@@ -1,0 +1,131 @@
+//SPDX-License-Identifier: GPL-3.0
+
+pragma solidity >=0.5.0 <0.9.0;
+
+//Allow eoa to create new auction contract to allow for scaling
+contract AuctionCreator{
+    Auction[] public auctions;
+
+    function createAuction() public{
+        Auction newAuction = new Auction(msg.sender);
+        auctions.push(newAuction);
+    }
+}
+
+contract Auction{
+    address payable public owner;
+    uint public startBlock;
+    uint public endBlock;
+    string public ipfsHash;
+
+    enum State {Started, Running, Ended, Cancelled}
+    State public auctionState;
+
+    uint public highestBindingBid;
+    address payable public highestBidder;
+
+    mapping(address => uint) public bids;
+    uint bidIncrement;
+
+    constructor(address eoa){
+        owner = payable(eoa);
+        auctionState = State.Running;
+        //It is a best practice to use blocknumbers for timing routines. A new block on Ethereum is mined every 15 seconds.
+        startBlock = block.number;
+        //40,320 = number of blocks expected in a week. (60secs/min * 60mins/hr * 24hrs/day * 7 days/week) / 15 seconds per block.
+        //endBlock = startBlock + 40320;
+        endBlock = startBlock + 3;
+        ipfsHash ="";
+        bidIncrement = 1 ether;
+    }
+
+    //Modifiers are used to eliminate redundent code for a function modifier that is used many times.
+    //Needs to end with _; to throw an error.
+    modifier notOwner(){
+        require(msg.sender != owner, "Owner cannot place bid on their own auction");
+        _;
+    }
+
+    modifier afterStart(){
+        require(block.number >= startBlock, "Auction has not started yet");
+        _;
+    }
+
+    modifier beforeEnd(){
+        require(block.number <= endBlock, "Auction has ended");
+        _;
+    }
+
+    modifier onlyOwner(){
+        require(msg.sender == owner, "Only the owner can execute this function");
+        _;
+    }
+
+    //Helper function to find minimum of two uints.
+    //Pure means does not read or store anything on the blockchain.
+    //Internal means only available to this contract.
+    function min(uint a, uint b) pure internal returns(uint){
+        if(a <= b){
+            return a;
+        } else{
+            return b;
+        }
+    }
+
+    //Allow owner to cancel the auction
+    function cancelAuction() public onlyOwner{
+        auctionState = State.Cancelled;
+    }
+
+    function placeBid() public payable notOwner afterStart beforeEnd{
+        require(auctionState == State.Running, "Auction is not running");
+        require(msg.value >= 100, "Error: please increase your bid");
+
+        uint currentBid = bids[msg.sender] + msg.value;
+        require(currentBid > highestBindingBid, "Error: bid is less than highest bid");
+
+        //Update bids mapping.
+        bids[msg.sender] = currentBid;
+
+        if(currentBid <= bids[highestBidder]){
+            highestBindingBid = min(currentBid + bidIncrement, bids[highestBidder]);
+        }else{
+            highestBindingBid = min(currentBid, bids[highestBidder] + bidIncrement);
+            highestBidder = payable(msg.sender);
+
+        }
+    }
+
+    //Never proactivley send ETH to any addrees. Upon auction's end all participants need to call this function.
+    //Best practice to avoid reeentracy attack like The DAO.
+    function finalizeAuction() public{
+        require(auctionState == State.Cancelled || block.number > endBlock, "Auction is still underway");
+        require(msg.sender == owner || bids[msg.sender] > 0, "Error: you do not have permission");
+
+        address payable recipient;
+        uint value;
+
+        if(auctionState == State.Cancelled){ //Routine when auction is cancelled. Send bidders back their ETH.
+            recipient = payable(msg.sender);
+            value = bids[msg.sender];
+        }else{ //Routine when auction has ended. Send owner the highestBindingBid.
+            if(msg.sender == owner){
+                recipient = owner;
+                value = highestBindingBid;
+            }else{ //This is a bidder
+                //Routine for highest bidder
+                if(msg.sender == highestBidder){
+                recipient = highestBidder;
+                value = bids[highestBidder] - highestBindingBid;
+                }else{ //Routine for losing bidders
+                    recipient = payable(msg.sender);
+                    value = bids[msg.sender];
+                }
+            }
+        }
+        //Reset the bids of the recipient.
+        bids[recipient] = 0;
+        //Sends funds to the recipient.
+        recipient.transfer(value);
+    }
+}
